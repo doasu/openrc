@@ -12,11 +12,15 @@ for config in "@SYSCONFDIR@/rc.conf" "$_sysconf/rc.conf"; do
 done
 
 case $1 in
-	start) _runlevel="${rc_default_runlevel:-default}";;
-	stop) _runlevel="shutdown";;
+	start) runlevel="${rc_default_runlevel:-default}";;
+	stop) runlevel="shutdown";;
 	*) eerror "no argument given to $0" && exit 1
 esac
 
-mkdir -p "$_sysconf/runlevels/$_runlevel"
+for runlevel_dir in sysinit "$runlevel" shutdown; do
+	mkdir -p "$_sysconf/runlevels/$runlevel_dir"
+done
 
-exec openrc --user "$_runlevel"
+openrc --user sysinit || exit 1
+printf '\n' >&3 # Notify openrc we're ready to start
+exec openrc --user "$runlevel"
