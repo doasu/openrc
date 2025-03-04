@@ -35,6 +35,7 @@ const char *extraopts = NULL;
 const char *usagestring = ""							\
 	"Usage: rc-update [options] add <service> [<runlevel>...]\n"	\
 	"   or: rc-update [options] del <service> [<runlevel>...]\n"	\
+	"   or: rc-update [options] env <variables>...\n"	\
 	"   or: rc-update [options] [show [<runlevel>...]]";
 const char getoptstring[] = "asu" getoptstring_COMMON;
 const struct option longopts[] = {
@@ -49,6 +50,8 @@ const char * const longopts_help[] = {
 	"Force an update of the dependency tree",
 	longopts_help_COMMON
 };
+
+extern const char **environ;
 
 /* Return the number of changes made:
  *  -1 = no changes (error)
@@ -190,11 +193,26 @@ show(RC_STRINGLIST *runlevels, bool verbose)
 	rc_stringlist_free(services);
 }
 
+static void
+env(char *variable)
+{
+	char *value = variable;
+	variable = strsep(&value, "=");
+
+	if (!value && !(value = getenv(variable))) {
+		ewarn("%s: environment variable %s not set, skipping.", applet, variable);
+		return;
+	}
+
+	rc_export_variable(variable, value);
+}
+
 enum update_action {
 	DO_NONE,
 	DO_ADD,
 	DO_DELETE,
 	DO_SHOW,
+	DO_ENV
 };
 
 int main(int argc, char **argv)
@@ -239,6 +257,8 @@ int main(int argc, char **argv)
 			action = DO_DELETE;
 		else if (strcmp(argv[optind], "show") == 0)
 			action = DO_SHOW;
+		else if (strcmp(argv[optind], "env") == 0)
+			action = DO_ENV;
 		else
 			usage(EXIT_FAILURE);
 		optind++;
@@ -249,16 +269,18 @@ int main(int argc, char **argv)
 	if (optind >= argc && action != DO_SHOW)
 		usage(EXIT_FAILURE);
 
-	service = argv[optind];
-	optind++;
+	if (action != DO_ENV) {
+		service = argv[optind];
+		optind++;
 
-	runlevels = rc_stringlist_new();
-	while (optind < argc) {
-		if (rc_runlevel_exists(argv[optind])) {
-			rc_stringlist_add(runlevels, argv[optind++]);
-		} else {
-			rc_stringlist_free(runlevels);
-			eerrorx("%s: '%s' is not a valid runlevel", applet, argv[optind]);
+		runlevels = rc_stringlist_new();
+		while (optind < argc) {
+			if (rc_runlevel_exists(argv[optind])) {
+				rc_stringlist_add(runlevels, argv[optind++]);
+			} else {
+				rc_stringlist_free(runlevels);
+				eerrorx("%s: '%s' is not a valid runlevel", applet, argv[optind]);
+			}
 		}
 	}
 
@@ -279,6 +301,10 @@ int main(int argc, char **argv)
 		rc_stringlist_sort(&runlevels);
 		show(runlevels, verbose);
 		goto exit;
+	case DO_ENV:
+		while (optind < argc)
+			env(argv[optind++]);
+		return 0;
 	case DO_ADD:
 		if (all_runlevels) {
 			rc_stringlist_free(runlevels);
