@@ -26,11 +26,13 @@
 #include <stdlib.h>
 #include <string.h>
 #include <time.h>
+#include <fcntl.h>
 #include <unistd.h>
 #include <sys/stat.h>
 #include <sys/reboot.h>
 #include <sys/types.h>
 #include <sys/wait.h>
+#include <poll.h>
 #include <utmp.h>
 
 #ifdef HAVE_SELINUX
@@ -38,45 +40,39 @@
 #endif
 
 #include "rc.h"
-#include "plugin.h"
+#include "rc_exec.h"
 #include "wtmp.h"
+#include "helpers.h"
 #include "version.h"
+
+/* on linux CLOCK_BOOTTIME provides proper POSIX CLOCK_MONOTONIC behavior. */
+#if defined(__linux__)
+#  undef  CLOCK_MONOTONIC
+#  define CLOCK_MONOTONIC CLOCK_BOOTTIME
+#endif
 
 static const char *path_default = "/sbin:/usr/sbin:/bin:/usr/bin";
 static const char *rc_default_runlevel = "default";
+static int sigpipe[2] = { -1, -1 };
+static bool quiet = false;
 
 static void do_openrc(const char *runlevel)
 {
-	pid_t pid;
-	sigset_t all_signals;
-	sigset_t our_signals;
+	const char *argv[] = { "openrc", runlevel, NULL };
+	struct exec_result res;
+	struct exec_args args = exec_init(argv);
+	args.setsid = 1;
 
-	sigfillset(&all_signals);
-	/* block all signals */
-	sigprocmask(SIG_BLOCK, &all_signals, &our_signals);
-	pid = fork();
-	switch (pid) {
-		case -1:
-			perror("fork");
-			exit(1);
-			break;
-		case 0:
-			setsid();
-			/* unblock all signals */
-			sigprocmask(SIG_UNBLOCK, &all_signals, NULL);
-			printf("Starting %s runlevel\n", runlevel);
-			execlp("openrc", "openrc", runlevel, NULL);
-			perror("exec");
-			exit(1);
-			break;
-		default:
-			/* restore our signal mask */
-			sigprocmask(SIG_SETMASK, &our_signals, NULL);
-			while (waitpid(pid, NULL, 0) != pid)
-				if (errno == ECHILD)
-					break;
-			break;
+	if (!quiet)
+		printf("Starting %s runlevel\n", runlevel);
+	res = do_exec(&args);
+	if (res.pid < 0) {
+		perror("do_exec");
+		exit(1);
 	}
+	while (waitpid(res.pid, NULL, 0) != res.pid)
+		if (errno == ECHILD)
+			break;
 }
 
 static void init(const char *default_runlevel)
@@ -91,7 +87,7 @@ static void init(const char *default_runlevel)
 	if (!runlevel)
 		runlevel = rc_default_runlevel;
 	if (!rc_runlevel_exists(runlevel)) {
-		printf("%s is an invalid runlevel\n", runlevel);
+		fprintf(stderr, "%s is an invalid runlevel\n", runlevel);
 		runlevel = rc_default_runlevel;
 	}
 	do_openrc(runlevel);
@@ -106,15 +102,42 @@ static void handle_reexec(char *my_name)
 
 static void handle_shutdown(const char *runlevel, int cmd)
 {
-	struct timespec ts;
+	const long ms_to_ns = 1000000L;
+	struct timespec start, now, tmp, remain;
 
 	do_openrc(runlevel);
-	printf("Sending the final term signal\n");
+	if (!quiet)
+		printf("Sending the final TERM signal\n");
 	kill(-1, SIGTERM);
-	ts.tv_sec = 3;
-	ts.tv_nsec = 0;
-	nanosleep(&ts, NULL);
-	printf("Sending the final kill signal\n");
+	clock_gettime(CLOCK_MONOTONIC, &start);
+
+	/* ensure *at least* half a second of grace time before KILL */
+	tmp.tv_sec = 0;
+	tmp.tv_nsec = 500 * ms_to_ns;
+	while (clock_nanosleep(CLOCK_MONOTONIC, 0, &tmp, &remain) < 0 && errno == EINTR)
+		tmp = remain;
+
+	for (;;) {
+		pid_t pid = waitpid(-1, NULL, WNOHANG);
+		if (pid == -1 && errno == ECHILD) {
+			/* all children reaped, safe to exit */
+			break;
+		}
+
+		clock_gettime(CLOCK_MONOTONIC, &now);
+		timespecsub(&now, &start, &tmp);
+		if (tmp.tv_sec >= 3) {
+			/* it's been 3 seconds already, go for the KILL hammer */
+			break;
+		}
+
+		tmp.tv_sec = 0;
+		tmp.tv_nsec = 100 * ms_to_ns;
+		clock_nanosleep(CLOCK_MONOTONIC, 0, &tmp, NULL);
+	}
+
+	if (!quiet)
+		printf("Sending the final KILL signal\n");
 	kill(-1, SIGKILL);
 	sync();
 	reboot(cmd);
@@ -122,28 +145,10 @@ static void handle_shutdown(const char *runlevel, int cmd)
 
 static void run_program(const char *prog)
 {
-	sigset_t full;
-	sigset_t old;
-	pid_t pid;
-
-	/* We need to block signals until we have forked */
-	sigfillset(&full);
-	sigprocmask(SIG_SETMASK, &full, &old);
-	pid = fork();
-	if (pid == -1) {
-		perror("init");
-		return;
-	}
-	if (pid == 0) {
-		/* Unmask signals */
-		sigprocmask(SIG_SETMASK, &old, NULL);
-		execl(prog, prog, (char *)NULL);
-		perror("init");
-		exit(1);
-	}
-	/* Unmask signals and wait for child */
-	sigprocmask(SIG_SETMASK, &old, NULL);
-	if (rc_waitpid(pid) == -1)
+	const char *argv[] = { prog, NULL };
+	struct exec_args args = exec_init(argv);
+	struct exec_result res = do_exec(&args);
+	if (res.pid < 0 || rc_waitpid(res.pid) == -1)
 		perror("init");
 }
 
@@ -184,50 +189,39 @@ static void handle_single(void)
 	do_openrc("single");
 }
 
-static void reap_zombies(void)
+static void signal_handler(int sig)
 {
-	pid_t pid;
+	int saved_errno = errno;
+	write(sigpipe[1], &sig, sizeof(sig));
+	/* ensure the errno doesn't get clobbered in the rare (impossible?)
+	 * case that the write above fails */
+	errno = saved_errno;
+}
+
+static void reap_zombies(int sig RC_UNUSED)
+{
+	char errmsg[] = "waitpid() failed\n";
+	int saved_errno = errno;
 
 	for (;;) {
-		pid = waitpid(-1, NULL, WNOHANG);
+		pid_t pid = waitpid(-1, NULL, WNOHANG);
 		if (pid == 0)
 			break;
 		else if (pid == -1) {
 			if (errno == ECHILD)
 				break;
-			perror("waitpid");
+			write(STDERR_FILENO, errmsg, sizeof(errmsg) - 1);
 			continue;
 		}
 	}
-}
-
-static void signal_handler(int sig)
-{
-	switch (sig) {
-		case SIGINT:
-			handle_shutdown("reboot", RB_AUTOBOOT);
-			break;
-		case SIGTERM:
-#ifdef SIGPWR
-		case SIGPWR:
-#endif
-			handle_shutdown("shutdown", RB_HALT_SYSTEM);
-			break;
-		case SIGCHLD:
-			reap_zombies();
-			break;
-		default:
-			printf("Unknown signal received, %d\n", sig);
-			break;
-	}
+	errno = saved_errno;
 }
 
 int main(int argc, char **argv)
 {
 	char *default_runlevel;
 	char buf[2048];
-	int count;
-	FILE *fifo;
+	int count, fifo, sig;
 	bool reexec = false;
 	sigset_t signals;
 	struct sigaction sa;
@@ -261,7 +255,10 @@ int main(int argc, char **argv)
 	}
 #endif
 
-	printf("OpenRC init version %s starting\n", VERSION);
+	quiet = rc_yesno(getenv("EINFO_QUIET"));
+
+	if (!quiet)
+		printf("OpenRC init version %s starting\n", VERSION);
 
 	if (argc > 1)
 		default_runlevel = argv[1];
@@ -270,6 +267,12 @@ int main(int argc, char **argv)
 
 	if (default_runlevel && strcmp(default_runlevel, "reexec") == 0)
 		reexec = true;
+
+
+	if (pipe2(sigpipe, O_NONBLOCK | O_CLOEXEC) == -1) {
+		perror("pipe2");
+		return 1;
+	}
 
 	/* block all signals we do not handle */
 	sigfillset(&signals);
@@ -283,8 +286,9 @@ int main(int argc, char **argv)
 
 	/* install signal  handler */
 	memset(&sa, 0, sizeof(sa));
-	sa.sa_handler = signal_handler;
+	sa.sa_handler = reap_zombies;
 	sigaction(SIGCHLD, &sa, NULL);
+	sa.sa_handler = signal_handler;
 	sigaction(SIGINT, &sa, NULL);
 	sigaction(SIGTERM, &sa, NULL);
 #ifdef SIGPWR
@@ -300,33 +304,62 @@ int main(int argc, char **argv)
 
 	if (mkfifo(RC_INIT_FIFO, 0600) == -1 && errno != EEXIST)
 		perror("mkfifo");
+	fifo = open(RC_INIT_FIFO, O_RDONLY | O_NONBLOCK | O_CLOEXEC);
+	if (fifo == -1)
+		perror("open");
 
 	for (;;) {
-		/* This will block until a command is sent down the pipe... */
-		fifo = fopen(RC_INIT_FIFO, "r");
-		if (!fifo) {
-			if (errno != EINTR)
-				perror("fopen");
-			continue;
+		enum { FD_FIFO, FD_SIG, FD_COUNT };
+		struct pollfd pfd[] = {
+			[FD_FIFO] = { .fd = fifo, .events = POLLIN },
+			[FD_SIG] = { .fd = sigpipe[0], .events = POLLIN },
+		};
+
+		poll(pfd, FD_COUNT, -1);
+
+		if (pfd[FD_SIG].revents & POLLIN) { /* handle signals first */
+			if (read(sigpipe[0], &sig, sizeof(sig)) != sizeof(sig)) {
+				/* shouldn't happen */
+				perror("read(sigpipe)");
+				continue;
+			}
+			switch (sig) {
+				case SIGINT:
+					handle_shutdown("reboot", RB_AUTOBOOT);
+					break;
+				case SIGTERM:
+#ifdef SIGPWR
+				case SIGPWR:
+#endif
+					handle_shutdown("shutdown", RB_HALT_SYSTEM);
+					break;
+				default:
+					fprintf(stderr, "Unknown signal received, %d\n", sig);
+					break;
+			}
 		}
-		count = fread(buf, 1, sizeof(buf) - 1, fifo);
-		buf[count] = 0;
-		fclose(fifo);
-		printf("PID1: Received \"%s\" from FIFO...\n", buf);
-		if (strcmp(buf, "halt") == 0)
-			handle_shutdown("shutdown", RB_HALT_SYSTEM);
-		else if (strcmp(buf, "kexec") == 0)
-			handle_shutdown("reboot", RB_KEXEC);
-		else if (strcmp(buf, "poweroff") == 0)
-			handle_shutdown("shutdown", RB_POWER_OFF);
-		else if (strcmp(buf, "reboot") == 0)
-			handle_shutdown("reboot", RB_AUTOBOOT);
-		else if (strcmp(buf, "reexec") == 0)
-			handle_reexec(argv[0]);
-		else if (strcmp(buf, "single") == 0) {
-			handle_single();
-			open_shell();
-			init(default_runlevel);
+
+		if (pfd[FD_FIFO].revents & POLLIN) {
+			count = read(fifo, buf, sizeof(buf) - 1);
+			buf[count] = 0;
+			if (!quiet)
+				printf("PID1: Received \"%s\" from FIFO...\n", buf);
+
+			if (strcmp(buf, "halt") == 0)
+				handle_shutdown("shutdown", RB_HALT_SYSTEM);
+			else if (strcmp(buf, "kexec") == 0)
+				handle_shutdown("reboot", RB_KEXEC);
+			else if (strcmp(buf, "poweroff") == 0)
+				handle_shutdown("shutdown", RB_POWER_OFF);
+			else if (strcmp(buf, "reboot") == 0)
+				handle_shutdown("reboot", RB_AUTOBOOT);
+			else if (strcmp(buf, "reexec") == 0)
+				handle_reexec(argv[0]);
+			else if (strcmp(buf, "single") == 0) {
+				handle_single();
+				open_shell();
+				init(default_runlevel);
+			}
 		}
 	}
 	return 0;

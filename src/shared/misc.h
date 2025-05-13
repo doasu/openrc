@@ -40,10 +40,31 @@ bool rc_conf_yesno(const char *var);
 void env_filter(void);
 void env_config(void);
 int signal_setup(int sig, void (*handler)(int));
-int signal_setup_restart(int sig, void (*handler)(int));
 int svc_lock(const char *, bool);
 int svc_unlock(const char *, int);
 pid_t exec_service(const char *, const char *);
+
+typedef struct rc_service_state_name {
+	RC_SERVICE state;
+	enum rc_dir dir;
+	const char *const name;
+} rc_service_state_name_t;
+
+/* We MUST list the states below 0x10 first
+ * The rest can be in any order */
+static const rc_service_state_name_t rc_service_state_names[] = {
+	{ RC_SERVICE_STARTED,     RC_DIR_STARTED,     "started" },
+	{ RC_SERVICE_STOPPED,     RC_DIR_INVALID,     "stopped" },
+	{ RC_SERVICE_STARTING,    RC_DIR_STARTING,    "starting" },
+	{ RC_SERVICE_STOPPING,    RC_DIR_STOPPING,    "stopping" },
+	{ RC_SERVICE_INACTIVE,    RC_DIR_INACTIVE,    "inactive" },
+	{ RC_SERVICE_WASINACTIVE, RC_DIR_WASINACTIVE, "wasinactive" },
+	{ RC_SERVICE_HOTPLUGGED,  RC_DIR_HOTPLUGGED,  "hotplugged" },
+	{ RC_SERVICE_FAILED,      RC_DIR_FAILED,      "failed" },
+	{ RC_SERVICE_SCHEDULED,   RC_DIR_SCHEDULED,   "scheduled"},
+	{ RC_SERVICE_CRASHED,     RC_DIR_INVALID,     "crashed"},
+	{ 0, -1, NULL}
+};
 
 /*
  * Check whether path is writable or not,
@@ -51,8 +72,8 @@ pid_t exec_service(const char *, const char *);
  */
 int is_writable(const char *);
 
-#define service_start(service) exec_service(service, "start");
-#define service_stop(service)  exec_service(service, "stop");
+#define service_start(service) exec_service(service, "start")
+#define service_stop(service)  exec_service(service, "stop")
 
 int parse_mode(mode_t *, char *);
 
@@ -66,17 +87,19 @@ pid_t get_pid(const char *applet, const char *pidfile);
 
 void cloexec_fds_from(int);
 
-struct ready {
+struct notify {
 	enum {
-		READY_NONE = 0,
-		READY_FD,
+		NOTIFY_NONE = 0,
+		NOTIFY_FD,
+		NOTIFY_SOCKET
 	} type;
 
+	char *path;
 	int pipe[2];
 	int fd;
 };
 
-struct ready ready_parse(const char *applet, const char *ready_string);
-bool ready_wait(const char *applet, struct ready ready);
+struct notify notify_parse(const char *applet, const char *ready_string);
+bool notify_wait(const char *applet, struct notify ready);
 
 #endif

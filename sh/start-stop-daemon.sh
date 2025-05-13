@@ -20,6 +20,11 @@ ssd_start()
 		return 0
 	fi
 
+	if [ -n "$ready" ]; then
+		ewarn "Use 'notify=$ready' instead of 'ready=$ready'"
+		notify="$ready"
+	fi
+
 	local _background=
 	ebegin "Starting ${name:-$RC_SVCNAME}"
 	if yesno "${command_background}"; then
@@ -45,6 +50,7 @@ ssd_start()
 		--exec $command \
 		${chroot:+--chroot} $chroot \
 		${directory:+--chdir} $directory \
+		${input_file+--stdin} $input_file \
 		${output_log+--stdout} $output_log \
 		${error_log+--stderr} $error_log \
 		${output_logger:+--stdout-logger \"$output_logger\"} \
@@ -56,7 +62,7 @@ ssd_start()
 		${pidfile:+--pidfile} $pidfile \
 		${command_user+--user} $command_user \
 		${umask+--umask} $umask \
-		${ready+--ready} $ready \
+		${notify+--notify} $notify \
 		$_background $start_stop_daemon_args \
 		-- $command_args $command_args_background
 	if eend $? "Failed to start ${name:-$RC_SVCNAME}"; then

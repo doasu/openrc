@@ -19,33 +19,32 @@
 
 #include "helpers.h"
 #include "rc.h"
+#include "rc_exec.h"
 
 static bool spawn_openrc(const struct passwd *user, bool start) {
-	int status = 0;
-	pid_t pid;
+	char *argv0;
+	const char *argv[] = {
+		NULL /* replaced below */, "-c",
+		start ? USER_SH "start" : USER_SH "stop", NULL
+	};
+	struct exec_result res;
+	struct exec_args args;
 
-	switch ((pid = fork())) {
-	case 0:
-		if (setgid(user->pw_gid) == -1 || setuid(user->pw_uid) == -1) {
-			elog(LOG_ERR, "Failed to set user ids: %s", strerror(errno));
-			exit(-1);
-		}
-
-		execl(user->pw_shell, "-", "-c", start ? USER_SH "start" : USER_SH "stop", NULL);
-		elog(LOG_ERR, "execl: %s", strerror(errno));
-		exit(-1);
-		break;
-
-	case -1:
-		elog(LOG_ERR, "fork: %s", strerror(errno));
+	/* shell might be a multicall binary, e.g busybox.
+	 * so setting argv[0] to "-" might not work */
+	xasprintf(&argv0, "-%s", user->pw_shell);
+	argv[0] = argv0;
+	args = exec_init(argv);
+	args.cmd = user->pw_shell;
+	args.uid = user->pw_uid;
+	args.gid = user->pw_gid;
+	res = do_exec(&args);
+	free(argv0);
+	if (res.pid < 0) {
+		elog(LOG_ERR, "do_exec: %s", strerror(errno));
 		return false;
-
-	default:
-		waitpid(pid, &status, 0);
-		break;
 	}
-
-	return status == 0;
+	return rc_waitpid(res.pid) == 0;
 }
 
 int main(int argc, char **argv) {
@@ -62,8 +61,8 @@ int main(int argc, char **argv) {
 
 	setenv("EINFO_LOG", "openrc-user", true);
 
-	if (argc < 2 || argc > 2) {
-		elog(LOG_ERR, "Invalid usaged. %s <username>", argv[0]);
+	if (argc != 2) {
+		elog(LOG_ERR, "Invalid usage. %s <username>", argv[0]);
 		return -1;
 	}
 
@@ -75,6 +74,7 @@ int main(int argc, char **argv) {
 	}
 
 	setenv("USER", user->pw_name, true);
+	setenv("LOGNAME", user->pw_name, true);
 	setenv("HOME", user->pw_dir, true);
 	setenv("SHELL", user->pw_shell, true);
 

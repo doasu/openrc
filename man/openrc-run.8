@@ -158,18 +158,23 @@ use this to change the user id, and optionally group id,  before
 or
 .Xr supervise-daemon 8
 launches the daemon.
-.It Ar output_log
-This is the path to a file or named pipe where the standard output from
-the service will be redirected. If you are starting this service with
+.It Ar input_file
+This is the path to a file or named pipe to which the standard input of the
+service will be redirected to. If you are starting this service with
 .Xr start-stop-daemon 8 ,
 ,  you must set
 .Pa command_background
 to true. Keep in mind that this path will be inside the chroot if the
 .Pa chroot
-variable is set.
+variable is set. Contrary to output and error redirection, input redirection
+assumes that the file exists already.
+.It Ar output_log
+The same thing as
+.Pa input_file
+but for the standard output.
 .It Ar error_log
 The same thing as
-.Pa output_log
+.Pa input_file
 but for the standard error output.
 .It Ar output_logger
 This is a process which will be used to log the standard output from the
@@ -243,11 +248,17 @@ Set the umask of the daemon.
 Keep in mind that eval is used to process chroot, command, command_args_*,
 command_user, pidfile and procname. This may affect how they are
 evaluated depending on how they are quoted.
-.It Ar ready
-.Xr start-stop-daemon 8
-and
-.Xr supervise-daemon 8
-will use this to wait until this daemon is ready. See their respective manpages.
+.It Ar notify
+Allows the daemon to notify the service manager, accepted values are
+.Ic fd: Ns Ar num
+which expects a newline in the open file descriptor
+.Ar num
+when the daemon is ready, and
+.Ic socket:ready
+which will export
+.Ar $NOTIFY_SOCKET
+and listen for notifications. At the moment supporting
+.Ar READY=1 Ns .
 .El
 .Sh DEPENDENCIES
 You should define a

@@ -5,7 +5,7 @@
  */
 
 /*
- * Copyright (c) 2016 The OpenRC Authors.
+ * Copyright (c) 2016-2025 The OpenRC Authors.
  * See the Authors file at the top-level directory of this distribution and
  * https://github.com/OpenRC/openrc/blob/HEAD/AUTHORS
  *
@@ -16,13 +16,8 @@
  *    except according to the terms contained in the LICENSE file.
  */
 
-/* nano seconds */
-#define POLL_INTERVAL   20000000
-#define WAIT_PIDFILE   500000000
-#define ONE_SECOND    1000000000
-#define ONE_MS           1000000
-
 #include <errno.h>
+#include <inttypes.h>
 #include <fcntl.h>
 #include <getopt.h>
 #include <limits.h>
@@ -62,9 +57,10 @@ static struct pam_conv conv = { NULL, NULL};
 #include "queue.h"
 #include "rc.h"
 #include "misc.h"
-#include "pipes.h"
+#include "rc_exec.h"
 #include "plugin.h"
 #include "schedules.h"
+#include "timeutils.h"
 #include "_usage.h"
 #include "helpers.h"
 
@@ -82,12 +78,14 @@ enum {
   LONGOPT_SECBITS,
   LONGOPT_STDERR_LOGGER,
   LONGOPT_STDOUT_LOGGER,
-  LONGOPT_READY,
+  LONGOPT_NOTIFY,
+  LONGOPT_RESPAWN_DELAY_STEP,
+  LONGOPT_RESPAWN_DELAY_CAP,
 };
 
 const char *applet = NULL;
 const char *extraopts = NULL;
-const char getoptstring[] = "A:a:D:d:e:g:H:I:Kk:m:N:p:R:r:s:Su:1:2:3" \
+const char getoptstring[] = "A:a:D:d:e:g:I:Kk:m:N:p:R:r:s:Su:0:1:2:3" \
 	getoptstring_COMMON;
 const struct option longopts[] = {
 	{ "healthcheck-timer",        1, NULL, 'a'},
@@ -96,6 +94,8 @@ const struct option longopts[] = {
 	{ "secbits",      1, NULL, LONGOPT_SECBITS},
 	{ "no-new-privs", 0, NULL, LONGOPT_NO_NEW_PRIVS},
 	{ "respawn-delay",        1, NULL, 'D'},
+	{ "respawn-delay-step",   1, NULL, LONGOPT_RESPAWN_DELAY_STEP},
+	{ "respawn-delay-cap",    1, NULL, LONGOPT_RESPAWN_DELAY_CAP},
 	{ "chdir",        1, NULL, 'd'},
 	{ "env",          1, NULL, 'e'},
 	{ "group",        1, NULL, 'g'},
@@ -112,12 +112,13 @@ const struct option longopts[] = {
 	{ "signal",       1, NULL, 's'},
 	{ "start",        0, NULL, 'S'},
 	{ "user",         1, NULL, 'u'},
+	{ "stdin",        1, NULL, '0'},
 	{ "stdout",       1, NULL, '1'},
 	{ "stderr",       1, NULL, '2'},
 	{ "stdout-logger",1, NULL, LONGOPT_STDOUT_LOGGER},
 	{ "stderr-logger",1, NULL, LONGOPT_STDERR_LOGGER},
 	{ "reexec",       0, NULL, '3'},
-	{ "ready",        1, NULL, LONGOPT_READY},
+	{ "notify",       1, NULL, LONGOPT_NOTIFY},
 	longopts_COMMON
 };
 const char * const longopts_help[] = {
@@ -127,6 +128,8 @@ const char * const longopts_help[] = {
 	"Set the security-bits for the program",
 	"Set the No New Privs flag for the program",
 	"Set a respawn delay",
+	"Increase the respawn delay by this amount for every retry",
+	"Set maximum respawn delay when respawn-delay-step is also active",
 	"Change the PWD",
 	"Set an environment string",
 	"Change the process group",
@@ -143,6 +146,7 @@ const char * const longopts_help[] = {
 	"Send a signal to the daemon",
 	"Start daemon",
 	"Change the process user",
+	"Redirect stdin to file",
 	"Redirect stdout to file",
 	"Redirect stderr to file",
 	"Redirect stdout to process",
@@ -167,7 +171,8 @@ static int devnull_fd = -1;
 static int stdin_fd;
 static int stdout_fd;
 static int stderr_fd;
-static struct ready ready;
+static struct notify notify;
+static char *redirect_stdin = NULL;
 static char *redirect_stderr = NULL;
 static char *redirect_stdout = NULL;
 static char *stderr_process = NULL;
@@ -177,9 +182,11 @@ static int tty_fd = -1;
 #endif
 static pid_t child_pid;
 static int respawn_count = 0;
-static int respawn_delay = 0;
+static int64_t respawn_delay; /* default set inside main() */
+static int64_t respawn_delay_step = TM_MS(128);
+static int64_t respawn_delay_cap = TM_SEC(30);
+static int64_t respawn_period; /* default set inside main() */
 static int respawn_max = 10;
-static int respawn_period = 0;
 static char *fifopath = NULL;
 static int fifo_fd = 0;
 static char *pidfile = NULL;
@@ -297,17 +304,16 @@ static char * expand_home(const char *home, const char *path)
 static char *make_cmdline(char **argv)
 {
 	char **c;
-	char *cmdline = NULL;
-	size_t len = 0;
+	char *cmdline;
+	size_t len;
+	FILE *mem = xopen_memstream(&cmdline, &len);
 
-	for (c = argv; c && *c; c++)
-		len += (strlen(*c) + 1);
-	cmdline = xmalloc(len+1);
-	memset(cmdline, 0, len+1);
 	for (c = argv; c && *c; c++) {
-		strcat(cmdline, *c);
-		strcat(cmdline, " ");
+		fputs(*c, mem);
+		if (c[1])
+			fputc(' ', mem);
 	}
+	xclose_memstream(mem);
 	return cmdline;
 }
 
@@ -509,17 +515,9 @@ RC_NORETURN static void child_process(char *exec, char **argv)
 #endif
 
 	TAILQ_FOREACH(env, env_list, entries) {
-		if ((strncmp(env->value, "RC_", 3) == 0 &&
-			strncmp(env->value, "RC_SERVICE=", 11) != 0 &&
-			strncmp(env->value, "RC_SVCNAME=", 11) != 0) ||
-		    strncmp(env->value, "SSD_NICELEVEL=", 14) == 0 ||
-		    strncmp(env->value, "SSD_IONICELEVEL=", 16) == 0 ||
-		    strncmp(env->value, "SSD_OOM_SCORE_ADJ=", 18) == 0)
-		{
-			p = strchr(env->value, '=');
-			*p = '\0';
+		if (strncmp(env->value, "RC_", 3) == 0 && strncmp(env->value, "SSD_", 4) == 0) {
+			*strchr(env->value, '=') = '\0';
 			unsetenv(env->value);
-			continue;
 		}
 	}
 	rc_stringlist_free(env_list);
@@ -554,6 +552,13 @@ RC_NORETURN static void child_process(char *exec, char **argv)
 	stdin_fd = devnull_fd;
 	stdout_fd = devnull_fd;
 	stderr_fd = devnull_fd;
+	if (redirect_stdin) {
+		if ((stdin_fd = open(redirect_stdin,
+			    O_RDONLY)) == -1)
+			eerrorx("%s: unable to open the input file"
+			    " for stdin `%s': %s",
+			    applet, redirect_stdin, strerror(errno));
+	}
 	if (redirect_stdout) {
 		if ((stdout_fd = open(redirect_stdout,
 			    O_WRONLY | O_CREAT | O_APPEND,
@@ -562,7 +567,7 @@ RC_NORETURN static void child_process(char *exec, char **argv)
 				    " for stdout `%s': %s",
 				    applet, redirect_stdout, strerror(errno));
 	} else if (stdout_process) {
-		stdout_fd = rc_pipe_command(stdout_process);
+		stdout_fd = rc_pipe_command(stdout_process, devnull_fd);
 		if (stdout_fd == -1)
 			eerrorx("%s: unable to open the logging process"
 			    " for stdout `%s': %s",
@@ -576,7 +581,7 @@ RC_NORETURN static void child_process(char *exec, char **argv)
 			    " for stderr `%s': %s",
 			    applet, redirect_stderr, strerror(errno));
 	} else if (stderr_process) {
-		stderr_fd = rc_pipe_command(stderr_process);
+		stderr_fd = rc_pipe_command(stderr_process, devnull_fd);
 		if (stderr_fd == -1)
 			eerrorx("%s: unable to open the logging process"
 			    " for stderr `%s': %s",
@@ -591,8 +596,8 @@ RC_NORETURN static void child_process(char *exec, char **argv)
 
 	cloexec_fds_from(3);
 
-	if (ready.type == READY_FD && dup2(ready.pipe[1], ready.fd) == -1)
-		eerrorx("Failed to initialize ready fd.");
+	if (notify.type == NOTIFY_FD && dup2(notify.pipe[1], notify.fd) == -1)
+		eerrorx("%s: failed to dup ready fd: %s", applet, strerror(errno));
 
 	cmdline = make_cmdline(argv);
 	syslog(LOG_INFO, "Child command line: %s", cmdline);
@@ -623,9 +628,9 @@ RC_NORETURN static void supervisor(char *exec, char **argv)
 	sigset_t old_signals;
 	sigset_t signals;
 	struct sigaction sa;
-	struct timespec ts;
-	time_t respawn_now= 0;
-	time_t first_spawn= 0;
+	int64_t respawn_now = 0;
+	int64_t first_spawn = 0;
+	int64_t sleep_for;
 
 	/* block all signals we do not handle */
 	sigfillset(&signals);
@@ -735,7 +740,7 @@ RC_NORETURN static void supervisor(char *exec, char **argv)
 			do_healthcheck = 0;
 			healthcheck_respawn = 0;
 			alarm(0);
-			respawn_now = time(NULL);
+			respawn_now = tm_now();
 			if (first_spawn == 0)
 				first_spawn = respawn_now;
 			if ((respawn_period > 0)
@@ -751,9 +756,10 @@ RC_NORETURN static void supervisor(char *exec, char **argv)
 				failing = 1;
 				continue;
 			}
-			ts.tv_sec = respawn_delay;
-			ts.tv_nsec = 0;
-			nanosleep(&ts, NULL);
+			sleep_for = respawn_delay + (respawn_delay_step * respawn_count);
+			if (respawn_delay_step > 0 && sleep_for > respawn_delay_cap)
+				sleep_for = respawn_delay_cap;
+			tm_sleep(sleep_for, TM_NO_EINTR);
 			if (exiting)
 				continue;
 			child_pid = fork();
@@ -814,6 +820,7 @@ int main(int argc, char **argv)
 	int n;
 	char *exec_file = NULL;
 	char *varbuf = NULL;
+	char numbuf[64];
 	struct timespec ts;
 	struct passwd *pw;
 	struct group *gr;
@@ -823,6 +830,8 @@ int main(int argc, char **argv)
 	char **child_argv = NULL;
 	char *str = NULL;
 	char *cmdline = NULL;
+	const char *respawn_delay_str  = "0";
+	const char *respawn_period_str = "12sec";
 
 	applet = basename_c(argv[0]);
 	atexit(cleanup);
@@ -923,9 +932,7 @@ int main(int argc, char **argv)
 			break;
 
 		case 'D':  /* --respawn-delay time */
-			n = sscanf(optarg, "%d", &respawn_delay);
-			if (n	!= 1 || respawn_delay < 1)
-				eerrorx("Invalid respawn-delay value '%s'", optarg);
+			respawn_delay_str = optarg;
 			break;
 
 		case 'I': /* --ionice */
@@ -956,9 +963,7 @@ int main(int argc, char **argv)
 			break;
 
 		case 'P':  /* --respawn-period time */
-			n = sscanf(optarg, "%d", &respawn_period);
-			if (n	!= 1 || respawn_period < 1)
-				eerrorx("Invalid respawn-period value '%s'", optarg);
+			respawn_period_str = optarg;
 			break;
 
 		case 's':  /* --signal */
@@ -986,11 +991,6 @@ int main(int argc, char **argv)
 				eerrorx("%s: group `%s' not found",
 				    applet, optarg);
 			gid = gr->gr_gid;
-			break;
-
-		case 'H':  /* --healthcheck-timer <minutes> */
-			if (sscanf(optarg, "%d", &healthchecktimer) != 1 || healthchecktimer < 1)
-				eerrorx("%s: invalid health check timer %s", applet, optarg);
 			break;
 
 		case 'k':
@@ -1057,6 +1057,10 @@ int main(int argc, char **argv)
 		}
 		break;
 
+		case '0':   /* --stdin /path/to/stdin.input-file */
+			redirect_stdin = optarg;
+			break;
+
 		case '1':   /* --stdout /path/to/stdout.lgfile */
 			redirect_stdout = optarg;
 			break;
@@ -1076,8 +1080,20 @@ int main(int argc, char **argv)
 			stderr_process = optarg;
 			break;
 
-		case LONGOPT_READY:
-			ready = ready_parse(applet, optarg);
+		case LONGOPT_NOTIFY:
+			notify = notify_parse(svcname, optarg);
+			break;
+
+		case LONGOPT_RESPAWN_DELAY_STEP:
+			respawn_delay_step = parse_duration(optarg);
+			if (respawn_delay_step < 0)
+				eerrorx("Invalid respawn-delay-step value '%s'", optarg);
+			break;
+
+		case LONGOPT_RESPAWN_DELAY_CAP:
+			respawn_delay_cap = parse_duration(optarg);
+			if (respawn_delay_cap < 0)
+				eerrorx("Invalid respawn-delay-cap value '%s'", optarg);
 			break;
 
 		case_RC_COMMON_GETOPT
@@ -1088,6 +1104,13 @@ int main(int argc, char **argv)
 	argc -= optind;
 	argv += optind;
 	exec = *argv;
+
+	respawn_delay = parse_duration(respawn_delay_str);
+	if (respawn_delay < 0)
+		eerrorx("Invalid respawn-delay value '%s'", respawn_delay_str);
+	respawn_period = parse_duration(respawn_period_str);
+	if (respawn_period < 0)
+		eerrorx("Invalid respawn-period value '%s'", respawn_period_str);
 
 	/* Expand ~ */
 	if (ch_dir && *ch_dir == '~')
@@ -1129,7 +1152,11 @@ int main(int argc, char **argv)
 			parse_schedule(applet, NULL, sig);
 
 		str = rc_service_value_get(svcname, "respawn_delay");
-		sscanf(str, "%d", &respawn_delay);
+		respawn_delay = parse_duration(str);
+		str = rc_service_value_get(svcname, "respawn_delay_step");
+		sscanf(str, "%"SCNd64, &respawn_delay_step);
+		str = rc_service_value_get(svcname, "respawn_delay_cap");
+		sscanf(str, "%"SCNd64, &respawn_delay_cap);
 		str = rc_service_value_get(svcname, "respawn_max");
 		sscanf(str, "%d", &respawn_max);
 		supervisor(exec, child_argv);
@@ -1178,8 +1205,12 @@ int main(int argc, char **argv)
 
 		if (respawn_period > 0 && respawn_delay * respawn_max > respawn_period)
 			ewarn("%s: Please increase the value of --respawn-period to more "
-				"than %d to avoid infinite respawning", applet,
-				respawn_delay * respawn_max);
+				"than %"PRId64" to avoid infinite respawning", applet,
+				(respawn_delay * respawn_max + 500)/1000);
+		if (respawn_delay_step > 0 && respawn_delay > respawn_delay_cap)
+			ewarn("%s: Please increase the value of --respawn-delay (%"PRId64"ms) to more "
+				"than --respawn-delay-cap (%"PRId64"ms)", applet,
+				respawn_delay, respawn_delay_cap);
 
 		if (retry) {
 			parse_schedule(applet, retry, sig);
@@ -1203,21 +1234,19 @@ int main(int argc, char **argv)
 		fclose(fp);
 
 		rc_service_value_set(svcname, "pidfile", pidfile);
-		varbuf = NULL;
-		xasprintf(&varbuf, "%i", respawn_delay);
-		rc_service_value_set(svcname, "respawn_delay", varbuf);
-		free(varbuf);
-		xasprintf(&varbuf, "%i", respawn_max);
-		rc_service_value_set(svcname, "respawn_max", varbuf);
-		free(varbuf);
-		xasprintf(&varbuf, "%i", respawn_period);
-		rc_service_value_set(svcname, "respawn_period", varbuf);
-		free(varbuf);
+		rc_service_value_set(svcname, "respawn_delay", respawn_delay_str);
+		rc_service_value_set(svcname, "respawn_period", respawn_period_str);
+		snprintf(numbuf, sizeof(numbuf), "%"PRId64, respawn_delay_step);
+		rc_service_value_set(svcname, "respawn_delay_step", numbuf);
+		snprintf(numbuf, sizeof(numbuf), "%"PRId64, respawn_delay_cap);
+		rc_service_value_set(svcname, "respawn_delay_cap", numbuf);
+		snprintf(numbuf, sizeof(numbuf), "%i", respawn_max);
+		rc_service_value_set(svcname, "respawn_max", numbuf);
 		child_pid = fork();
 		if (child_pid == -1)
 			eerrorx("%s: fork: %s", applet, strerror(errno));
 		if (child_pid != 0)
-			exit(ready_wait(applet, ready) ? EXIT_SUCCESS : EXIT_FAILURE);
+			exit(notify_wait(applet, notify) ? EXIT_SUCCESS : EXIT_FAILURE);
 
 #ifdef TIOCNOTTY
 		tty_fd = open("/dev/tty", O_RDWR);
@@ -1227,15 +1256,15 @@ int main(int argc, char **argv)
 		dup2(devnull_fd, STDOUT_FILENO);
 		dup2(devnull_fd, STDERR_FILENO);
 
-		if (ready.type == READY_FD)
-			close(ready.pipe[0]);
+		if (notify.type == NOTIFY_FD)
+			close(notify.pipe[0]);
 
 		child_pid = fork();
 		if (child_pid == -1)
 			eerrorx("%s: fork: %s", applet, strerror(errno));
 		else if (child_pid != 0) {
-			if (ready.type == READY_FD)
-				close(ready.pipe[1]);
+			if (notify.type == NOTIFY_FD)
+				close(notify.pipe[1]);
 			c = argv;
 			x = 0;
 			while (c && *c) {
@@ -1247,9 +1276,8 @@ int main(int argc, char **argv)
 				x++;
 				c++;
 			}
-			xasprintf(&varbuf, "%d", x);
-			rc_service_value_set(svcname, "argc", varbuf);
-			free(varbuf);
+			snprintf(numbuf, sizeof(numbuf), "%d", x);
+			rc_service_value_set(svcname, "argc", numbuf);
 			rc_service_value_set(svcname, "exec", exec);
 			supervisor(exec, argv);
 		} else

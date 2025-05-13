@@ -2,7 +2,7 @@
   start-stop-daemon
  * Starts, stops, tests and signals daemons
  *
- * This is essentially a ground up re-write of Debians
+ * This is essentially a ground up re-write of Debian's
  * start-stop-daemon for cleaner code and to integrate into our RC
  * system so we can monitor daemons a little.
  */
@@ -21,7 +21,7 @@
 
 #define ONE_MS           1000000
 
-#ifdef __linux__
+#if defined(__linux__) && !defined(_GNU_SOURCE)
 /* For extra SCHED_* defines. */
 # define _GNU_SOURCE
 #endif
@@ -70,7 +70,7 @@ static struct pam_conv conv = { NULL, NULL};
 #include "queue.h"
 #include "rc.h"
 #include "misc.h"
-#include "pipes.h"
+#include "rc_exec.h"
 #include "schedules.h"
 #include "_usage.h"
 #include "helpers.h"
@@ -89,12 +89,12 @@ enum {
   LONGOPT_SCHEDULER,
   LONGOPT_SCHEDULER_PRIO,
   LONGOPT_SECBITS,
-  LONGOPT_READY,
+  LONGOPT_NOTIFY,
 };
 
 const char *applet = NULL;
 const char *extraopts = NULL;
-const char getoptstring[] = "I:KN:PR:Sa:bc:d:e:g:ik:mn:op:s:tu:r:w:x:1:2:3:4:" \
+const char getoptstring[] = "I:KN:PR:Sa:bc:d:e:g:ik:mn:op:s:tu:r:w:x:0:1:2:3:4:" \
 	getoptstring_COMMON;
 const struct option longopts[] = {
 	{ "capabilities", 1, NULL, LONGOPT_CAPABILITIES},
@@ -124,6 +124,7 @@ const struct option longopts[] = {
 	{ "chroot",       1, NULL, 'r'},
 	{ "wait",         1, NULL, 'w'},
 	{ "exec",         1, NULL, 'x'},
+	{ "stdin",        1, NULL, '0'},
 	{ "stdout",       1, NULL, '1'},
 	{ "stderr",       1, NULL, '2'},
 	{ "stdout-logger",1, NULL, '3'},
@@ -131,7 +132,7 @@ const struct option longopts[] = {
 	{ "progress",     0, NULL, 'P'},
 	{ "scheduler",    1, NULL, LONGOPT_SCHEDULER},
 	{ "scheduler-priority",    1, NULL, LONGOPT_SCHEDULER_PRIO},
-	{ "ready",        1, NULL, LONGOPT_READY},
+	{ "notify",        1, NULL, LONGOPT_NOTIFY},
 	longopts_COMMON
 };
 const char * const longopts_help[] = {
@@ -162,6 +163,7 @@ const char * const longopts_help[] = {
 	"Chroot to this directory",
 	"Milliseconds to wait for daemon start",
 	"Binary to start/stop",
+	"Redirect stdin to file",
 	"Redirect stdout to file",
 	"Redirect stderr to file",
 	"Redirect stdout to process",
@@ -169,6 +171,7 @@ const char * const longopts_help[] = {
 	"Print dots each second while waiting",
 	"Set process scheduler",
 	"Set process scheduler priority",
+	"Configures experimental notification behaviour",
 	longopts_help_COMMON
 };
 const char *usagestring = NULL;
@@ -318,6 +321,7 @@ int main(int argc, char **argv)
 	gid_t gid = 0;
 	char *home = NULL;
 	int tid = 0;
+	char *redirect_stdin = NULL;
 	char *redirect_stderr = NULL;
 	char *redirect_stdout = NULL;
 	char *stderr_process = NULL;
@@ -355,7 +359,7 @@ int main(int argc, char **argv)
 	int pipefd[2];
 	char readbuf[1];
 	ssize_t ss;
-	struct ready ready = {0};
+	struct notify notify = {0};
 	int ret = EXIT_SUCCESS;
 
 	applet = basename_c(argv[0]);
@@ -601,6 +605,10 @@ int main(int argc, char **argv)
 			exec = optarg;
 			break;
 
+		case '0':   /* --stdin /path/to/stdin.input-file */
+			redirect_stdin = optarg;
+			break;
+
 		case '1':   /* --stdout /path/to/stdout.lgfile */
 			redirect_stdout = optarg;
 			break;
@@ -625,8 +633,8 @@ int main(int argc, char **argv)
 			sscanf(optarg, "%d", &sched_prio);
 			break;
 
-		case LONGOPT_READY:
-			ready = ready_parse(applet, optarg);
+		case LONGOPT_NOTIFY:
+			notify = notify_parse(svcname ? svcname : applet, optarg);
 			break;
 
 		case_RC_COMMON_GETOPT
@@ -1026,17 +1034,9 @@ int main(int argc, char **argv)
 #endif
 
 		TAILQ_FOREACH(env, env_list, entries) {
-			if ((strncmp(env->value, "RC_", 3) == 0 &&
-				strncmp(env->value, "RC_SERVICE=", 11) != 0 &&
-				strncmp(env->value, "RC_SVCNAME=", 11) != 0) ||
-				strncmp(env->value, "SSD_NICELEVEL=", 14) == 0 ||
-				strncmp(env->value, "SSD_IONICELEVEL=", 16) == 0 ||
-				strncmp(env->value, "SSD_OOM_SCORE_ADJ=", 18) == 0)
-			{
-				p = strchr(env->value, '=');
-				*p = '\0';
+			if (strncmp(env->value, "RC_", 3) == 0 && strncmp(env->value, "SSD_", 4) == 0) {
+				*strchr(env->value, '=') = '\0';
 				unsetenv(env->value);
-				continue;
 			}
 		}
 		rc_stringlist_free(env_list);
@@ -1071,6 +1071,13 @@ int main(int argc, char **argv)
 		stdin_fd = devnull_fd;
 		stdout_fd = devnull_fd;
 		stderr_fd = devnull_fd;
+		if (redirect_stdin) {
+			if ((stdin_fd = open(redirect_stdin,
+				    O_RDONLY)) == -1)
+				eerrorx("%s: unable to open the input file"
+				    " for stdin `%s': %s",
+				    applet, redirect_stdin, strerror(errno));
+		}
 		if (redirect_stdout) {
 			if ((stdout_fd = open(redirect_stdout,
 				    O_WRONLY | O_CREAT | O_APPEND,
@@ -1079,7 +1086,7 @@ int main(int argc, char **argv)
 				    " for stdout `%s': %s",
 				    applet, redirect_stdout, strerror(errno));
 		}else if (stdout_process) {
-			stdout_fd = rc_pipe_command(stdout_process);
+			stdout_fd = rc_pipe_command(stdout_process, devnull_fd);
 			if (stdout_fd == -1)
 				eerrorx("%s: unable to open the logging process"
 				    " for stdout `%s': %s",
@@ -1093,7 +1100,7 @@ int main(int argc, char **argv)
 				    " for stderr `%s': %s",
 				    applet, redirect_stderr, strerror(errno));
 		}else if (stderr_process) {
-			stderr_fd = rc_pipe_command(stderr_process);
+			stderr_fd = rc_pipe_command(stderr_process, devnull_fd);
 			if (stderr_fd == -1)
 				eerrorx("%s: unable to open the logging process"
 				    " for stderr `%s': %s",
@@ -1111,9 +1118,11 @@ int main(int argc, char **argv)
 
 		cloexec_fds_from(3);
 
-		if (ready.type == READY_FD) {
-			if (close(ready.pipe[0]) == -1 || dup2(ready.pipe[1], ready.fd) == -1)
-				eerrorx("Failed to initialize ready fd.");
+		if (notify.type == NOTIFY_FD) {
+			if (close(notify.pipe[0]) == -1)
+				eerrorx("%s: failed to close notify pipe[0]: %s", applet, strerror(errno));
+			if (dup2(notify.pipe[1], notify.fd) == -1)
+				eerrorx("%s: failed to initialize notify fd: %s", applet, strerror(errno));
 		}
 
 		if (scheduler != NULL) {
@@ -1200,8 +1209,8 @@ int main(int argc, char **argv)
 			start_wait = 0;
 	}
 
-	if (ready.type != READY_NONE) {
-		if (!ready_wait(applet, ready))
+	if (notify.type != NOTIFY_NONE) {
+		if (!notify_wait(applet, notify))
 			ret = EXIT_FAILURE;
 	} else if (start_wait > 0) {
 		struct timespec ts;

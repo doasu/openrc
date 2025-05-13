@@ -1,5 +1,5 @@
 project('OpenRC', 'c',
-  version : '0.60',
+  version : '0.62',
   license: 'BSD-2',
   default_options : [
     'bindir=/bin',
@@ -92,6 +92,11 @@ rc_shdir = rc_libexecdir / 'sh'
 sbindir = get_option('prefix') / get_option('sbindir')
 pamdir = get_option('sysconfdir') / 'pam.d'
 
+pam_libdir = get_option('pam_libdir')
+if pam_libdir == ''
+  pam_libdir = libdir / 'security'
+endif
+
 crypt_dep = []
 
 selinux_dep = dependency('libselinux', required : get_option('selinux'))
@@ -130,25 +135,20 @@ elif os == 'GNU'
   cc_os_flags = ['-D_DEFAULT_SOURCE', '-DPATH_MAX=4096']
 endif
 
-# Try and use some good cc flags if we're building from git. We don't use
-# -pedantic as it will warn about our perfectly valid use of %m in our logger.
-# We should be using -Wredundant-decls, but our library hidden proto stuff gives
-# loads of warnings. I don't fully understand it (the hidden proto, not the
-# warning) so we just silence the warning.
+# The following warnings are not included in warning_level = 3, but we
+# are keeping them for now.
 cc_warning_flags_test = [
   '-Wcast-align',
   '-Wcast-qual',
   '-Wdeclaration-after-statement',
   '-Wformat=2',
   '-Winline',
-  '-Wmismatched-dealloc',
   '-Wmissing-declarations',
   '-Wmissing-format-attribute',
   '-Wmissing-noreturn',
   '-Wmissing-prototypes',
   '-Wnested-externs',
   '-Wpointer-arith',
-  '-Wsequence-point',
   '-Wshadow',
   '-Wwrite-strings',
   '-Werror=implicit-int',
@@ -160,6 +160,8 @@ cc_warning_flags = cc.get_supported_arguments(cc_warning_flags_test)
 cc_flags = [cc_debug_flags, cc_os_flags, cc_warning_flags]
 add_project_arguments(cc_flags, language : 'c')
 
+feature_macros = {}
+
 # Meson's has_function_attribute doesn't know about GCC's extended
 # version (with arguments), so we have to build a test program instead.
 malloc_attribute_test = '''#include<stdlib.h>
@@ -167,18 +169,30 @@ __attribute__ ((malloc (free, 1)))
 int func() { return 0; }
 '''
 if cc.compiles(malloc_attribute_test, name : 'malloc attribute with arguments')
-  add_project_arguments('-DHAVE_MALLOC_EXTENDED_ATTRIBUTE', language: 'c')
+  feature_macros += { '-DHAVE_MALLOC_EXTENDED_ATTRIBUTE': 1 }
 endif
 
 if cc.has_function('close_range', prefix: '#define _GNU_SOURCE\n#include <unistd.h>')
-  add_project_arguments('-DHAVE_CLOSE_RANGE', language: 'c')
+  feature_macros += { '-DHAVE_CLOSE_RANGE': 1, '-D_GNU_SOURCE': 1 }
 elif cc.has_header('linux/close_range.h')
-  add_project_arguments('-DHAVE_LINUX_CLOSE_RANGE_H', language: 'c')
+  feature_macros += { '-DHAVE_LINUX_CLOSE_RANGE_H': 1 }
 endif
 
-if cc.has_function('strlcpy', prefix: '#define _GNU_SOURCE\n#include <string.h>')
-  add_project_arguments('-DHAVE_STRLCPY', language: 'c')
+if cc.has_function('strlcpy', prefix: '#include <string.h>')
+  feature_macros += { '-DHAVE_STRLCPY': 1 }
+elif cc.has_function('strlcpy', prefix: '#define _GNU_SOURCE\n#include <string.h>')
+  feature_macros += { '-DHAVE_STRLCPY': 1, '-D_GNU_SOURCE': 1 }
 endif
+
+if not cc.has_function('pipe2', prefix: '#include <unistd.h>')
+  if cc.has_function('pipe2', prefix: '#define _GNU_SOURCE\n#include <unistd.h>')
+    feature_macros += { '-D_GNU_SOURCE': 1 }
+  else
+    error('C function pipe2() not found')
+  endif
+endif
+
+add_project_arguments(feature_macros.keys(), language: 'c')
 
 incdir = include_directories('src/shared')
 einfo_incdir = include_directories('src/libeinfo')
@@ -199,6 +213,7 @@ subdir('etc')
 subdir('init.d')
 subdir('local.d')
 subdir('man')
+subdir('runlevels')
 subdir('sh')
 subdir('src')
 subdir('support')
@@ -228,12 +243,6 @@ if get_option('pkgconfig')
   )
 endif
 
-meson.add_install_script('tools/meson_runlevels.sh',
-  os,
-  get_option('newnet') ? 'yes' : 'no',
-  rc_libexecdir,
-  get_option('sysconfdir'),
-  get_option('sysvinit') ? 'yes' : 'no')
 meson.add_install_script('tools/meson_final.sh',
   rc_libexecdir,
   os)
